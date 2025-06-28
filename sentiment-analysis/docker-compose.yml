@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  sentiment-analysis:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "9000:8001"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LOCAL_LLM_URL=${LOCAL_LLM_URL:-http://host.docker.internal:1234/v1/chat/completions}
+      - LOCAL_LLM_MODEL=${LOCAL_LLM_MODEL:-default}
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - sentiment-network
+
+networks:
+  sentiment-network:
+    driver: bridge 
