@@ -2,19 +2,32 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import asyncio
-import aiohttp
 import os
 from datetime import datetime
 from typing import List, Dict, Optional
 import json
 from dotenv import load_dotenv
 import re
-from gnews import GNews
-from functools import partial
+from contextlib import asynccontextmanager
+from google_genai_client import get_llm_config, get_google_genai_model, call_llm_batch
+from fastapi.responses import JSONResponse
 
 load_dotenv()
 
-app = FastAPI(title="Sentiment Analysis Service")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Initialize the Google GenAI model on startup
+    print("Application startup: Initializing Google GenAI model...")
+    model = get_google_genai_model()
+    if model:
+        print("Google GenAI model initialized successfully.")
+    else:
+        print("ERROR: Google GenAI model failed to initialize. The application might not function correctly.")
+    yield
+    # Clean up resources if needed on shutdown (not necessary for this client)
+    print("Application shutdown.")
+
+app = FastAPI(title="Sentiment Analysis Service", lifespan=lifespan)
 
 # CORS middleware
 app.add_middleware(
@@ -25,13 +38,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Local LLM Configuration
-LOCAL_LLM_URL = os.getenv('LOCAL_LLM_URL', 'http://localhost:1234/v1/chat/completions')
-LOCAL_LLM_MODEL = os.getenv('LOCAL_LLM_MODEL', 'default')
-
+# Model definitions for the API
 class SentimentRequest(BaseModel):
     symbol: str
-    max_articles: int = 10
+
+class BatchSentimentRequest(BaseModel):
+    symbols: List[str]
 
 class SentimentResponse(BaseModel):
     symbol: str
@@ -41,381 +53,213 @@ class SentimentResponse(BaseModel):
     summary_reasoning: Optional[str] = None
     key_bullish_factors: Optional[List[str]] = None
     key_bearish_factors: Optional[List[str]] = None
+    investment_recommendation: Optional[str] = None
+    business_quality_assessment: Optional[str] = None
+    valuation_perspective: Optional[str] = None
+    contrarian_signal: Optional[str] = None
+    intelligent_investor_summary: Optional[str] = None
     articles_analyzed: int
-    articles: List[Dict]
+    articles: List[Dict] # This will contain sources found by the model
     timestamp: str
 
-def search_gnews_blocking(query: str, max_results: int):
-    """Blocking function to search GNews, designed to be run in an executor."""
-    print(f"Searching Google News for: {query}")
-    try:
-        gnews_client = GNews(language='en', country='US', max_results=max_results)
-        return gnews_client.get_news(query)
-    except Exception as e:
-        print(f"gnews query failed for '{query}': {e}")
-        return None
-
-async def scrape_google_news(symbol: str, company_name: str, max_articles: int) -> List[Dict]:
-    """Scrape news articles from Google News using financial-specific search terms."""
-    print(f"Scraping Google News for {symbol} ({company_name}) with financial context")
-    
-    search_queries = [
-        f'"{company_name}" stock',
-        f'"{symbol}" stock',
-        f'"{company_name}" finance',
-        f'"{symbol}" earnings'
-    ]
-    
-    loop = asyncio.get_running_loop()
-    tasks = []
-    # Distribute max_articles across our queries, with a minimum of 5
-    max_per_query = max(5, max_articles // len(search_queries))
-    
-    for query in search_queries:
-        # Use functools.partial to pass arguments to the executor function
-        func = partial(search_gnews_blocking, query, max_per_query)
-        tasks.append(loop.run_in_executor(None, func))
-        
-    search_results = await asyncio.gather(*tasks)
-    
-    combined_news = []
-    for result in search_results:
-        if result:
-            combined_news.extend(result)
-
-    articles = []
-    seen_urls = set()
-
-    for item in combined_news:
-        if item['url'] not in seen_urls:
-            articles.append({
-                'title': item.get('title'),
-                'url': item.get('url'),
-                'summary': item.get('description'),
-                'published': item.get('published date'),
-                'source': item.get('publisher', {}).get('title')
-            })
-            seen_urls.add(item['url'])
-    
-    print(f"Found {len(articles)} unique articles from Google News.")
-    return articles[:max_articles]
-
-async def scrape_news_articles(symbol: str, max_articles: int = 10) -> List[Dict]:
-    """Scrape news articles from Google News."""
-    
-    company_names = {
-        'AAPL': 'Apple', 'TSLA': 'Tesla', 'MSFT': 'Microsoft', 'GOOGL': 'Google',
-        'AMZN': 'Amazon', 'NVDA': 'NVIDIA', 'META': 'Meta', 'NFLX': 'Netflix',
-        'AMD': 'AMD', 'SPY': 'SPDR S&P 500', 'QQQ': 'Invesco QQQ', 'IWM': 'iShares Russell 2000',
-        'SNAP': 'Snap Inc.'
-    }
-    company_name = company_names.get(symbol, symbol)
-    
-    articles = await scrape_google_news(symbol, company_name, max_articles)
-    
-    # If no articles found, throw an error
-    if not articles:
-        raise Exception(f"Failed to scrape any articles for {symbol} from Google News. Service may be blocked or unavailable.")
-    
-    # Remove duplicates and limit to max_articles
-    unique_articles = []
-    seen_urls = set()
-    
-    for article in articles:
-        if article['url'] not in seen_urls and len(unique_articles) < max_articles:
-            unique_articles.append(article)
-            seen_urls.add(article['url'])
-    
-    if not unique_articles:
-        raise Exception(f"No unique articles found for {symbol} after deduplication.")
-    
-    return unique_articles
-    
-def clean_text(text: str) -> str:
-    """Clean HTML and special characters from text"""
-    if text is None:
-        return ""
-    # Remove HTML tags
-    text = re.sub(r'<[^>]+>', '', text)
-    # Remove extra whitespace
-    text = re.sub(r'\s+', ' ', text)
-    # Remove special characters but keep basic punctuation
-    text = re.sub(r'[^\w\s\.\,\!\?\-\:\;]', '', text)
-    return text.strip()
-
-async def call_local_llm(prompt: str) -> str:
-    """Call local LLM API"""
-    try:
-        async with aiohttp.ClientSession() as session:
-            payload = {
-                "model": LOCAL_LLM_MODEL,
-                "messages": [
-                    {"role": "system", "content": "You are a financial analyst specializing in sentiment analysis. Provide accurate, unbiased sentiment scores based on financial news content."},
-                    {"role": "user", "content": prompt}
-                ],
-                "temperature": 0.3,
-                "max_tokens": 500
-            }
-            
-            async with session.post(LOCAL_LLM_URL, json=payload, timeout=30) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return data['choices'][0]['message']['content']
-                else:
-                    print(f"Local LLM API error: {response.status}")
-                    return None
-                    
-    except Exception as e:
-        print(f"Error calling local LLM: {e}")
-        return None
-
-async def analyze_article_sentiment(article: Dict) -> Dict:
-    """Analyze sentiment of a single article using local LLM"""
-    
-    try:
-        # Prepare text for analysis
-        text = f"Title: {article['title']}\n\nSummary: {article['summary']}"
-        
-        # Create prompt for numerical sentiment analysis
-        prompt = f"""
-        Analyze the sentiment of this financial news article about {article.get('symbol', 'a company')}.
-        
-        Article:
-        {text}
-        
-        Provide a sentiment analysis with a numerical score from 0 to 100, where:
-        - 0-20: Very Bearish (extremely negative)
-        - 21-40: Bearish (negative)
-        - 41-60: Neutral (balanced)
-        - 61-80: Bullish (positive)
-        - 81-100: Very Bullish (extremely positive)
-        
-        Respond in this exact JSON format. Your entire response MUST be only the JSON object, without any markdown, comments, or other text.
-        {{
-            "sentiment_score": <number between 0 and 100>,
-            "confidence": <number between 0 and 100>,
-            "reasoning": "<brief explanation of the sentiment score>",
-            "key_factors": ["<factor1>", "<factor2>", "<factor3>"]
-        }}
-        
-        Focus on financial impact and market sentiment. Consider:
-        - Earnings, revenue, growth prospects
-        - Market position and competition
-        - Regulatory or legal issues
-        - Management changes or strategy shifts
-        - Market reaction and analyst opinions
-        - Overall tone and language used
-        """
-        
-        # Call local LLM
-        response_text = await call_local_llm(prompt)
-        
-        if response_text:
-            # Extract JSON from response
-            try:
-                # Find JSON in the response
-                start = response_text.find('{')
-                end = response_text.rfind('}') + 1
-                json_str = response_text[start:end]
-                sentiment_data = json.loads(json_str)
-                
-                # Validate the sentiment score is within 0-100 range
-                score = sentiment_data.get('sentiment_score', 50)
-                score = max(0, min(100, score))  # Clamp to 0-100
-                
-                return {
-                    'sentiment_score': score,
-                    'confidence': sentiment_data.get('confidence', 50),
-                    'reasoning': sentiment_data.get('reasoning', ''),
-                    'key_factors': sentiment_data.get('key_factors', [])
-                }
-                
-            except json.JSONDecodeError:
-                raise Exception(f"LLM returned invalid JSON: {response_text}")
-        else:
-            raise Exception("LLM is not available or not responding")
-            
-    except Exception as e:
-        print(f"Error analyzing sentiment: {e}")
-        raise Exception(f"Sentiment analysis failed: {str(e)}")
-
-async def analyze_overall_sentiment(symbol: str, articles: List[Dict]) -> Dict:
-    """Analyze the overall sentiment from a list of analyzed articles using a second LLM call."""
-    
-    prompt_data = []
-    for article in articles:
-        prompt_data.append({
-            "title": article['title'],
-            "source": article['source'],
-            "sentiment": article['sentiment']
-        })
-
-    prompt = f"""
-    You are a lead financial analyst providing a final investment summary for {symbol}.
-    You have received the following sentiment analyses for a collection of recent news articles.
-    Your task is to synthesize this information into a single, conclusive overview.
-
-    Here is the data from your junior analysts:
-    ---
-    {json.dumps(prompt_data, indent=2)}
-    ---
-
-    Review all the articles, paying attention to the sentiment scores, confidence levels, and reasoning provided for each.
-    Provide a final, consolidated sentiment analysis. Your entire response MUST be only the JSON object, without any markdown, comments, or other text.
-
-    {{
-        "overall_sentiment_score": <a single number from 0 to 100>,
-        "sentiment_label": "<'Very Bullish', 'Bullish', 'Neutral', 'Bearish', or 'Very Bearish'>",
-        "confidence": <a single number from 0 to 100, representing your confidence in this *overall* analysis>,
-        "summary_reasoning": "<A concise paragraph summarizing the key drivers for your final sentiment. Mention the dominant themes, conflicting reports, and why you are leaning in a particular direction.>",
-        "key_bullish_factors": ["<factor1>", "<factor2>"],
-        "key_bearish_factors": ["<factor1>", "<factor2>"]
-    }}
-
-    Base your final judgment on the weight of the evidence. For example, a strong earnings report might outweigh general market jitters.
+def get_master_prompt(symbol: str) -> str:
     """
+    Creates the master prompt for the Gemini model, instructing it to perform
+    sentiment analysis based on its training data and knowledge.
+    """
+    return f"""
+You are a world-class financial analyst specializing in sentiment analysis. Your task is to analyze the stock symbol '{symbol}' based on your knowledge of recent market trends, financial news, and business fundamentals.
+
+INSTRUCTIONS:
+1. Analyze the current market sentiment for '{symbol}' based on your knowledge of recent developments, earnings, business performance, and market conditions.
+2. Consider both fundamental analysis (business quality, competitive position, financial health) and market sentiment factors.
+3. Provide a comprehensive analysis that focuses on business fundamentals and investment merit, not just stock price movement.
+4. **You MUST return your analysis in the exact key-value format specified below.** Do not add any extra text or explanations outside of this format.
+
+RETURN FORMAT:
+OVERALL_SENTIMENT_SCORE: [A number from 0 (extremely bearish) to 100 (extremely bullish)]
+SENTIMENT_LABEL: [Bullish/Bearish/Neutral]
+CONFIDENCE: [A number from 0 to 100, representing your confidence in the analysis]
+SUMMARY_REASONING: [A concise, 2-3 sentence explanation for your sentiment score from an investor's perspective]
+KEY_BULLISH_FACTORS: [A comma-separated list of the top 3-5 bullish points based on your knowledge]
+KEY_BEARISH_FACTORS: [A comma-separated list of the top 3-5 bearish points based on your knowledge]
+INVESTMENT_RECOMMENDATION: [Buy/Hold/Sell/Avoid]
+BUSINESS_QUALITY_ASSESSMENT: [High/Medium/Low, based on competitive moat, management, and profitability]
+VALUATION_PERSPECTIVE: [Likely Overvalued/Fairly Valued/Likely Undervalued, based on your assessment]
+CONTRARIAN_SIGNAL: [Strong Buy/Buy/Hold/Avoid, based on whether current sentiment seems to misprice the long-term quality]
+INTELLIGENT_INVESTOR_SUMMARY: [A 3-sentence summary as if explaining to a fellow value investor]
+ARTICLES_ANALYZED: [Set this to 5 to indicate analysis based on your training knowledge]
+ARTICLES: [Return an empty JSON array: []]
+"""
+
+def parse_llm_response(response_text: str) -> Optional[Dict]:
+    """
+    Parses the structured key-value response from the LLM.
+    This is a more robust version that handles multi-line values.
+    """
+    if not response_text:
+        return None
     
-    response_text = await call_local_llm(prompt)
+    data = {}
+    # Use regex to find key-value pairs, allowing for multi-line values.
+    # It looks for a KEY:, then captures everything until the next KEY:.
+    # The `(?=...|$)` is a lookahead that asserts the position is followed by another key or end of string.
+    pattern = re.compile(r"(\w+):\s*(.*?)(?=\n\w+:\s*|$)", re.DOTALL)
+    
+    for match in pattern.finditer(response_text):
+        key = match.group(1).strip().lower().replace(' ', '_')
+        value = match.group(2).strip()
+        data[key] = value
 
-    if response_text:
-        try:
-            start = response_text.find('{')
-            end = response_text.rfind('}') + 1
-            json_str = response_text[start:end]
-            final_sentiment_data = json.loads(json_str)
+    # Specific parsing for numeric and list/JSON fields
+    try:
+        data['overall_sentiment'] = float(data.get('overall_sentiment_score', 50.0))
+        data['confidence'] = float(data.get('confidence', 50.0))
+        data['articles_analyzed'] = int(data.get('articles_analyzed', 0))
+        
+        if 'key_bullish_factors' in data and isinstance(data['key_bullish_factors'], str):
+            data['key_bullish_factors'] = [f.strip() for f in data['key_bullish_factors'].split(',') if f.strip()]
+        
+        if 'key_bearish_factors' in data and isinstance(data['key_bearish_factors'], str):
+            data['key_bearish_factors'] = [f.strip() for f in data['key_bearish_factors'].split(',') if f.strip()]
             
-            if all(k in final_sentiment_data for k in ["overall_sentiment_score", "sentiment_label", "confidence", "summary_reasoning"]):
-                return final_sentiment_data
-            else:
-                raise Exception("LLM response for final analysis is missing required keys.")
+        if 'articles' in data and isinstance(data['articles'], str):
+            try:
+                # The LLM might return a JSON string, try to parse it
+                data['articles'] = json.loads(data['articles'])
+            except json.JSONDecodeError:
+                print(f"[PARSE] Could not parse 'articles' field as JSON. Value was: {data['articles']}")
+                data['articles'] = [] # Default to empty list on failure
+        else:
+            data['articles'] = [] # Ensure articles is a list
+                
+    except (ValueError, TypeError) as e:
+        print(f"[PARSE] Error during data type conversion: {e}")
+        # Return partial data or None
+        return data # Return what was parsed
 
-        except json.JSONDecodeError:
-            raise Exception(f"Final LLM analysis returned invalid JSON: {response_text}")
-    else:
-        raise Exception("Final LLM analysis call failed or returned no response.")
+    return data
 
 @app.get("/")
 async def root():
     return {
-        "message": "Sentiment Analysis Service", 
+        "message": "Sentiment Analysis Service",
         "status": "running",
-        "local_llm_url": LOCAL_LLM_URL,
-        "local_llm_model": LOCAL_LLM_MODEL
+        **get_llm_config()
     }
 
 @app.post("/analyze", response_model=SentimentResponse)
 async def analyze_sentiment(request: SentimentRequest):
-    """Analyze sentiment for a stock symbol"""
+    """
+    Analyzes sentiment for a single stock symbol using the cost-effective Batch API.
+    """
+    print(f"[MAIN] Starting agentic sentiment analysis for {request.symbol} via batch API.")
     
     try:
-        # Step 1: Scrape news articles
-        print(f"Scraping news for {request.symbol}...")
-        articles = await scrape_news_articles(request.symbol, request.max_articles)
+        # Step 1: Create a batch request with a single prompt
+        prompts = [get_master_prompt(request.symbol)]
         
-        if not articles:
-            return SentimentResponse(
-                symbol=request.symbol,
-                overall_sentiment=50.0,
-                sentiment_label="Neutral",
-                confidence=0.0,
-                articles_analyzed=0,
-                articles=[],
-                timestamp=datetime.now().isoformat()
-            )
+        # Step 2: Call the LLM with the batch endpoint
+        print(f"[MAIN] Calling LLM batch endpoint for single symbol: {request.symbol}...")
+        batch_responses = await call_llm_batch(prompts, enable_search=True)
         
-        # Step 2: Analyze sentiment for each article concurrently
-        print(f"Analyzing sentiment for {len(articles)} articles...")
+        if not batch_responses or not batch_responses[0]:
+            raise HTTPException(status_code=500, detail="LLM call failed or returned an empty response.")
         
-        analysis_tasks = []
-        for article in articles:
-            article['symbol'] = request.symbol
-            analysis_tasks.append(analyze_article_sentiment(article))
+        response_text = batch_responses[0]
         
-        individual_sentiments = await asyncio.gather(*analysis_tasks, return_exceptions=True)
+        # Step 3: Parse the structured response
+        print(f"[MAIN] Parsing LLM response for {request.symbol}...")
+        parsed_data = parse_llm_response(response_text)
         
-        analyzed_articles = []
-        for i, result in enumerate(individual_sentiments):
-            if isinstance(result, dict):
-                articles[i]['sentiment'] = result
-                analyzed_articles.append(articles[i])
-            else:
-                print(f"Article analysis failed for '{articles[i]['title']}': {result}")
-
-        if not analyzed_articles:
-            raise Exception("Sentiment analysis failed for all articles.")
-
-        # Step 3: Perform final overall sentiment analysis with a second LLM call
-        print("Performing final analysis on all articles...")
-        final_analysis = await analyze_overall_sentiment(request.symbol, analyzed_articles)
-        
-        # Step 4: Construct the final response
-        return SentimentResponse(
+        if not parsed_data:
+            print(f"[MAIN] Failed to parse the response from the LLM. Raw response:\n{response_text}")
+            raise HTTPException(status_code=500, detail="Failed to parse the structured response from the LLM.")
+            
+        # Step 4: Construct the final response object
+        print(f"[MAIN] Constructing final response for {request.symbol}")
+        response = SentimentResponse(
             symbol=request.symbol,
-            overall_sentiment=round(final_analysis['overall_sentiment_score'], 1),
-            sentiment_label=final_analysis['sentiment_label'],
-            confidence=round(final_analysis['confidence'], 1),
-            summary_reasoning=final_analysis.get('summary_reasoning', ''),
-            key_bullish_factors=final_analysis.get('key_bullish_factors', []),
-            key_bearish_factors=final_analysis.get('key_bearish_factors', []),
-            articles_analyzed=len(analyzed_articles),
-            articles=analyzed_articles,
+            overall_sentiment=round(parsed_data.get('overall_sentiment', 50.0), 1),
+            sentiment_label=parsed_data.get('sentiment_label', 'Neutral'),
+            confidence=round(parsed_data.get('confidence', 0), 1),
+            summary_reasoning=parsed_data.get('summary_reasoning', ''),
+            key_bullish_factors=parsed_data.get('key_bullish_factors', []),
+            key_bearish_factors=parsed_data.get('key_bearish_factors', []),
+            investment_recommendation=parsed_data.get('investment_recommendation'),
+            business_quality_assessment=parsed_data.get('business_quality_assessment'),
+            valuation_perspective=parsed_data.get('valuation_perspective'),
+            contrarian_signal=parsed_data.get('contrarian_signal'),
+            intelligent_investor_summary=parsed_data.get('intelligent_investor_summary'),
+            articles_analyzed=parsed_data.get('articles_analyzed', 0),
+            articles=parsed_data.get('articles', []),
             timestamp=datetime.now().isoformat()
         )
         
+        print(f"[MAIN] Analysis complete for {request.symbol}. Overall sentiment: {response.overall_sentiment}")
+        return response
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error analyzing sentiment: {str(e)}")
+        print(f"[MAIN] ERROR in agentic sentiment analysis for {request.symbol}: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
+@app.post("/analyze-batch", response_model=List[SentimentResponse])
+async def analyze_sentiment_batch(request: BatchSentimentRequest):
+    """
+    Analyzes sentiment for a batch of stock symbols using the cost-effective Batch API.
+    """
+    print(f"[MAIN] Starting agentic sentiment analysis for {request.symbols} via batch API.")
+    prompts = [get_master_prompt(symbol) for symbol in request.symbols]
+    
+    results = await call_llm_batch(prompts, enable_search=True)
+    
+    if not results:
+        return JSONResponse(status_code=500, content={"error": "LLM call failed or returned an empty response."})
+
+    final_results = []
+    for i, response_text in enumerate(results):
+        symbol = request.symbols[i]
+        if not response_text:
+            print(f"[MAIN] Batch analysis for symbol '{symbol}' failed or returned empty response.")
+            # Optionally create a default error response
+            # For now, we'll just skip it
+            continue
+
+        parsed_data = parse_llm_response(response_text)
+        if not parsed_data:
+            print(f"[MAIN] Failed to parse response for symbol '{symbol}'.")
+            continue
+        
+        response = SentimentResponse(
+            symbol=symbol,
+            overall_sentiment=round(parsed_data.get('overall_sentiment', 50.0), 1),
+            sentiment_label=parsed_data.get('sentiment_label', 'Neutral'),
+            confidence=round(parsed_data.get('confidence', 0), 1),
+            summary_reasoning=parsed_data.get('summary_reasoning', ''),
+            key_bullish_factors=parsed_data.get('key_bullish_factors', []),
+            key_bearish_factors=parsed_data.get('key_bearish_factors', []),
+            investment_recommendation=parsed_data.get('investment_recommendation'),
+            business_quality_assessment=parsed_data.get('business_quality_assessment'),
+            valuation_perspective=parsed_data.get('valuation_perspective'),
+            contrarian_signal=parsed_data.get('contrarian_signal'),
+            intelligent_investor_summary=parsed_data.get('intelligent_investor_summary'),
+            articles_analyzed=parsed_data.get('articles_analyzed', 0),
+            articles=parsed_data.get('articles', []),
+            timestamp=datetime.now().isoformat()
+        )
+        final_results.append(response)
+
+    print(f"[MAIN] Batch analysis complete. Returning {len(final_results)} results.")
+    return final_results
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
     return {
-        "status": "healthy", 
+        "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "local_llm_url": LOCAL_LLM_URL,
-        "local_llm_model": LOCAL_LLM_MODEL
+        **get_llm_config()
     }
-
-@app.post("/test-llm")
-async def test_llm():
-    """Test endpoint to verify LLM integration works with real data"""
-    try:
-        # Test with real RSS scraping for a popular stock
-        test_symbol = "AAPL"
-        print(f"Testing LLM with real RSS data for {test_symbol}...")
-        
-        # Scrape real articles
-        articles = await scrape_news_articles(test_symbol, max_articles=1)
-        
-        if not articles:
-            return {
-                "error": f"No real articles found for {test_symbol}. RSS feeds may be blocked.",
-                "llm_working": False,
-                "rss_working": False,
-                "timestamp": datetime.now().isoformat()
-            }
-        
-        # Test LLM with first real article
-        test_article = articles[0]
-        test_article['symbol'] = test_symbol
-        
-        # Analyze sentiment using LLM
-        sentiment_result = await analyze_article_sentiment(test_article)
-        
-        return {
-            "test_article": test_article,
-            "llm_sentiment": sentiment_result,
-            "llm_working": True,
-            "rss_working": True,
-            "timestamp": datetime.now().isoformat()
-        }
-        
-    except Exception as e:
-        return {
-            "error": str(e),
-            "llm_working": False,
-            "rss_working": False,
-            "timestamp": datetime.now().isoformat()
-        }
 
 if __name__ == "__main__":
     import uvicorn

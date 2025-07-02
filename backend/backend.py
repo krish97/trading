@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -10,7 +11,7 @@ import hashlib
 import requests
 import time
 from typing import Optional
-from alpha_vantage.timeseries import TimeSeries
+from polygon import RESTClient
 from dotenv import load_dotenv
 import logging
 
@@ -27,13 +28,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Alpha Vantage Configuration
-ALPHA_VANTAGE_API_KEY = os.getenv('ALPHA_VANTAGE_API_KEY', 'demo')
-ts = TimeSeries(key=ALPHA_VANTAGE_API_KEY, output_format='pandas')
+# Polygon.io Configuration
+POLYGON_API_KEY = os.getenv('POLYGON_API_KEY')
+polygon_client = RESTClient(POLYGON_API_KEY)
 
 # Setup logging for debug
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("spungus-backend")
+
+# Get the sentiment service URL from environment variables
+SENTIMENT_SERVICE_URL = os.getenv("SENTIMENT_SERVICE_URL")
+
+def get_sentiment_from_service(symbol: str) -> dict:
+    """Get a rich sentiment analysis object from the dedicated sentiment service."""
+    if not SENTIMENT_SERVICE_URL:
+        raise Exception("SENTIMENT_SERVICE_URL is not configured.")
+
+    url = f"{SENTIMENT_SERVICE_URL}/analyze"
+    try:
+        # The sentiment analysis can take time, so use a long timeout.
+        response = requests.post(url, json={"symbol": symbol}, timeout=180)
+        response.raise_for_status()  # Raises an HTTPError for bad responses (4xx or 5xx)
+        return response.json()
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout when calling sentiment service for {symbol}")
+        raise Exception(f"Sentiment analysis for {symbol} timed out.")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Could not connect to sentiment analysis service: {e}")
+        raise Exception(f"Sentiment analysis service is unavailable for {symbol}.")
 
 def calculate_ema(data, period):
     """Calculate Exponential Moving Average for a pandas Series or list of prices"""
@@ -68,72 +90,6 @@ def calculate_fibonacci_levels(high, low):
         '1.0': high
     }
 
-def get_real_news_sentiment(symbol: str) -> dict:
-    """Get real news sentiment using NewsAPI"""
-    
-    # Get API key from environment variable (you'll need to set this)
-    api_key = os.getenv('NEWS_API_KEY')
-    
-    if not api_key:
-        raise Exception("NEWS_API_KEY not configured. Please set your NewsAPI key.")
-    
-    try:
-        # Search for news about the company
-        company_name = get_company_name(symbol)
-        query = f"{symbol} OR {company_name}"
-        
-        # NewsAPI endpoint
-        url = "https://newsapi.org/v2/everything"
-        params = {
-            'q': query,
-            'language': 'en',
-            'sortBy': 'publishedAt',
-            'pageSize': 20,  # Get last 20 articles
-            'apiKey': api_key
-        }
-        
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        
-        data = response.json()
-        
-        if data['status'] != 'ok' or not data.get('articles'):
-            raise Exception("No news articles found")
-        
-        # Analyze sentiment from article titles and descriptions
-        articles = data['articles']
-        sentiment_scores = []
-        
-        for article in articles:
-            # Combine title and description for analysis
-            text = f"{article.get('title', '')} {article.get('description', '')}"
-            if text.strip():
-                score = analyze_text_sentiment(text)
-                sentiment_scores.append(score)
-        
-        if not sentiment_scores:
-            raise Exception("No sentiment could be analyzed from articles")
-        
-        # Calculate average sentiment
-        avg_sentiment = sum(sentiment_scores) / len(sentiment_scores)
-        
-        # Normalize to 0-1 scale
-        normalized_sentiment = (avg_sentiment + 1) / 2  # Convert from -1,1 to 0,1
-        
-        # Determine confidence based on number of articles
-        confidence = min(0.95, 0.5 + (len(articles) * 0.02))
-        
-        return {
-            'score': round(normalized_sentiment, 3),
-            'label': 'Bullish' if normalized_sentiment > 0.6 else 'Bearish' if normalized_sentiment < 0.4 else 'Neutral',
-            'confidence': round(confidence, 2),
-            'articles_analyzed': len(articles),
-            'source': 'NewsAPI'
-        }
-        
-    except Exception as e:
-        raise Exception(f"NewsAPI error: {e}")
-
 def get_company_name(symbol: str) -> str:
     """Get company name from symbol"""
     company_names = {
@@ -153,99 +109,86 @@ def get_company_name(symbol: str) -> str:
     }
     return company_names.get(symbol, symbol)
 
-def analyze_text_sentiment(text: str) -> float:
-    """Simple sentiment analysis using keyword scoring"""
-    
-    # Convert to lowercase for analysis
-    text_lower = text.lower()
-    
-    # Positive keywords (financial context)
-    positive_words = [
-        'bullish', 'surge', 'rally', 'gain', 'rise', 'up', 'positive', 'strong',
-        'beat', 'exceed', 'growth', 'profit', 'earnings', 'revenue', 'upgrade',
-        'buy', 'outperform', 'strong buy', 'positive outlook', 'growth',
-        'innovation', 'breakthrough', 'success', 'win', 'leading', 'top'
-    ]
-    
-    # Negative keywords (financial context)
-    negative_words = [
-        'bearish', 'drop', 'fall', 'decline', 'down', 'negative', 'weak',
-        'miss', 'disappoint', 'loss', 'decline', 'downgrade', 'sell',
-        'underperform', 'strong sell', 'negative outlook', 'concern',
-        'risk', 'warning', 'trouble', 'problem', 'issue', 'challenge'
-    ]
-    
-    # Count occurrences
-    positive_count = sum(1 for word in positive_words if word in text_lower)
-    negative_count = sum(1 for word in negative_words if word in text_lower)
-    
-    # Calculate sentiment score (-1 to 1)
-    total_words = positive_count + negative_count
-    if total_words == 0:
-        return 0  # Neutral if no sentiment words found
-    
-    sentiment_score = (positive_count - negative_count) / total_words
-    
-    # Apply some weighting based on text length and keyword density
-    keyword_density = total_words / len(text.split())
-    sentiment_score *= min(1.0, keyword_density * 10)  # Scale by density
-    
-    return max(-1.0, min(1.0, sentiment_score))  # Clamp to -1, 1
-
 def get_sentiment_score(symbol: str):
-    """Get sentiment score using real news sentiment or throw error"""
-    
-    # Try to get real news sentiment first
+    """
+    Fetches the sentiment analysis from the dedicated microservice.
+    This function acts as a wrapper for the new service call.
+    """
     try:
-        sentiment_data = get_real_news_sentiment(symbol)
-        if sentiment_data['source'] != 'Simulated':
-            return sentiment_data
+        # This now calls our new, powerful sentiment analysis service
+        sentiment_data = get_sentiment_from_service(symbol)
+        return sentiment_data
     except Exception as e:
-        print(f"Real news sentiment failed: {e}")
-    
-    # If no real sentiment available, throw error instead of using simulated data
-    raise Exception(f"No sentiment data available for {symbol}. Please check your API configuration.")
+        logger.error(f"Error getting sentiment for {symbol} from service: {e}")
+        # Propagate the exception to be handled by the API endpoint
+        raise
 
-def get_stock_data_with_retry(symbol: str, max_retries: int = 3, delay: float = 1.0):
-    """Get stock data with retry logic using Alpha Vantage"""
+def get_stock_data_with_retry(symbol: str, max_retries: int = 3, delay: float = 2.0):
+    """
+    Get stock data from Polygon.io, with retry logic.
+    Fetches daily bars for historical data and derives the current and previous day's prices.
+    """
     for attempt in range(max_retries):
         try:
-            # Get daily data from Alpha Vantage
-            data, meta_data = ts.get_daily(symbol=symbol, outputsize='compact')
+            # Get the last 200 days of daily bars for EMA calculations
+            today = datetime.now().date()
+            start_date = today - timedelta(days=200) # Fetch more data for accurate EMAs
             
-            if data.empty:
-                raise Exception(f"No historical data available for {symbol}")
+            aggs = polygon_client.get_aggs(
+                ticker=symbol,
+                multiplier=1,
+                timespan="day",
+                from_=start_date.strftime("%Y-%m-%d"),
+                to=today.strftime("%Y-%m-%d"),
+                limit=5000 # Max limit
+            )
+
+            if not aggs or len(aggs) < 2:
+                raise Exception(f"Insufficient historical data for {symbol} from Polygon.io (need at least 2 days).")
+
+            # Convert to DataFrame for easier processing
+            df = pd.DataFrame(aggs)
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
             
-            # Get current quote
-            quote_data, quote_meta = ts.get_quote_endpoint(symbol=symbol)
+            # The current price is the close of the most recent trading day (T-1)
+            current_price = df.iloc[-1]['close']
             
-            # Validate quote data
-            if not quote_data or '05. price' not in quote_data or '08. previous close' not in quote_data:
-                raise Exception(f"Incomplete quote data for {symbol}")
+            # The previous close is from the day before that (T-2)
+            prev_close_price = df.iloc[-2]['close']
+
+            quote_data = {
+                '05. price': current_price,
+                '08. previous close': prev_close_price
+            }
+            meta_data = {
+                '3. Last Refreshed': df.index[-1].isoformat()
+            }
             
-            return data, quote_data, meta_data
+            return df, quote_data, meta_data
             
         except Exception as e:
-            if "429" in str(e) or "Too Many Requests" in str(e) or "API call frequency" in str(e):
-                if attempt < max_retries - 1:
-                    print(f"Rate limited, retrying in {delay} seconds... (attempt {attempt + 1}/{max_retries})")
-                    time.sleep(delay)
-                    delay *= 2  # Exponential backoff
-                    continue
-                else:
-                    raise Exception(f"Alpha Vantage rate limit exceeded. Please upgrade to premium plan or wait for rate limit reset. Error: {str(e)}")
+            error_str = str(e).lower()
+            # Polygon uses 429 for rate limiting
+            is_rate_limit = "status_code=429" in error_str or "too many requests" in error_str
+            
+            if is_rate_limit and attempt < max_retries - 1:
+                print(f"Polygon.io rate limit hit, retrying in {delay} seconds... (attempt {attempt + 1}/{max_retries})")
+                time.sleep(delay)
+                delay *= 2
+                continue
             else:
-                raise Exception(f"Alpha Vantage error: {str(e)}")
+                raise Exception(f"Polygon.io API error for {symbol}: {str(e)}")
     
-    raise Exception(f"Failed to get data for {symbol} after {max_retries} attempts")
+    raise Exception(f"Failed to get data for {symbol} from Polygon.io after {max_retries} attempts")
 
-@app.get("/price")
-def get_price(symbol: str = Query(...)):
+@app.get("/api/price/{symbol}")
+def get_price(symbol: str):
     try:
         # Get stock data
         data, quote_data, meta_data = get_stock_data_with_retry(symbol)
         
-        # Get real-time quote data (no fallbacks)
+        # Get real-time quote data
         current_price = float(quote_data['05. price'])
         prev_close = float(quote_data['08. previous close'])
         
@@ -254,10 +197,10 @@ def get_price(symbol: str = Query(...)):
         price_change_percent = ((price_change / prev_close) * 100) if prev_close > 0 else 0
         
         # Calculate EMAs
-        data['EMA5'] = calculate_ema(data['4. close'], 5)
-        data['EMA12'] = calculate_ema(data['4. close'], 12)
-        data['EMA34'] = calculate_ema(data['4. close'], 34)
-        data['EMA50'] = calculate_ema(data['4. close'], 50)
+        data['EMA5'] = calculate_ema(data['close'], 5)
+        data['EMA12'] = calculate_ema(data['close'], 12)
+        data['EMA34'] = calculate_ema(data['close'], 34)
+        data['EMA50'] = calculate_ema(data['close'], 50)
         
         # Get latest values
         latest = data.iloc[-1]
@@ -267,11 +210,11 @@ def get_price(symbol: str = Query(...)):
         trend = "Bullish" if ema_5_12_above_34_50 else "Bearish"
         
         # Calculate Fibonacci levels from recent high/low
-        recent_high = float(data['2. high'].max())
-        recent_low = float(data['3. low'].min())
+        recent_high = float(data['high'].max())
+        recent_low = float(data['low'].min())
         fib_levels = calculate_fibonacci_levels(recent_high, recent_low)
         
-        # Get the actual data timestamp from Alpha Vantage
+        # Get the actual data timestamp from Polygon.io
         data_timestamp = meta_data.get('3. Last Refreshed', datetime.now().isoformat())
         if isinstance(data_timestamp, str):
             try:
@@ -299,8 +242,8 @@ def get_price(symbol: str = Query(...)):
     except Exception as e:
         return {"error": f"Failed to get price data for {symbol}: {str(e)}"}
 
-@app.get("/sentiment")
-def get_sentiment(symbol: str = Query(...)):
+@app.get("/api/sentiment/{symbol}")
+def get_sentiment(symbol: str):
     try:
         sentiment_data = get_sentiment_score(symbol)
         return {
@@ -309,6 +252,7 @@ def get_sentiment(symbol: str = Query(...)):
             "timestamp": datetime.now().isoformat()
         }
     except Exception as e:
+        # The error from get_sentiment_score is already descriptive
         return {"error": str(e)}
 
 def generate_trading_signal(price_data, sentiment_score):
@@ -512,7 +456,7 @@ def generate_trading_signal(price_data, sentiment_score):
         "sentiment": {
             "score": sentiment_score,
             "details": {
-                "note": "Local LLM sentiment analysis available",
+                "note": "Sentiment from dedicated AI service.",
                 "current_sentiment": "Bullish" if sentiment_score > 10 else "Bearish" if sentiment_score < -10 else "Neutral"
             }
         }
@@ -696,17 +640,23 @@ async def get_signal(symbol: str):
         current_price = float(quote_data['05. price'])
         market_time = meta_data.get('3. Last Refreshed', 0)
         
-        # Generate sentiment score
+        # Generate sentiment score from the dedicated service
         sentiment_data = get_sentiment_score(symbol)
-        # Convert 0-100 scale to -50 to +50 scale for signal generation
-        sentiment_score = (sentiment_data['score'] - 50)  # Convert 0-100 to -50 to +50
+
+        # The signal generator expects a score from -50 to +50.
+        # The service provides 'overall_sentiment' on a 0-100 scale.
+        overall_sentiment = sentiment_data.get('overall_sentiment', 50.0)
+        sentiment_for_signal_generator = overall_sentiment - 50.0
         
         # Convert to list for calculations
-        price_data = [float(x) for x in data['4. close'].tolist()]
+        price_data = [float(x) for x in data['close'].tolist()]
         
         # Generate trading signal using Spungus methodology
-        signal, signal_score, components = generate_trading_signal(price_data, sentiment_score)
+        signal, signal_score, components = generate_trading_signal(price_data, sentiment_for_signal_generator)
         
+        # Replace the basic sentiment component with the full, rich data from the service
+        components['sentiment'] = sentiment_data
+
         # Generate option recommendations
         recommendations = generate_option_recommendation(signal, signal_score, components)
         
@@ -723,35 +673,12 @@ async def get_signal(symbol: str):
     except Exception as e:
         return {"error": f"Failed to get signal for {symbol}: {str(e)}"}
 
+@app.get("/api/health")
+def health_check():
+    return {"status": "ok"}
+
 # Serve React app for all other routes
-@app.get("/{full_path:path}")
-def serve_react_app(request: Request, full_path: str):
-    """Serve React app for all non-API routes"""
-    # Skip API routes
-    if full_path.startswith(("price", "sentiment", "signal")):
-        return {"detail": "Not Found"}
-    
-    frontend_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend"))
-    
-    # Handle root path - serve index.html
-    if not full_path or full_path == "":
-        index_path = os.path.join(frontend_dir, "index.html")
-        if os.path.exists(index_path):
-            return FileResponse(index_path)
-        else:
-            return {"message": "Frontend not found. Please build the React app first."}
-    
-    # Try to serve static files
-    file_path = os.path.join(frontend_dir, full_path)
-    if os.path.exists(file_path) and os.path.isfile(file_path):
-        return FileResponse(file_path)
-    
-    # Fall back to index.html for React routing
-    index_path = os.path.join(frontend_dir, "index.html")
-    if os.path.exists(index_path):
-        return FileResponse(index_path)
-    
-    return {"message": "Frontend not found. Please build the React app first."}
+app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
 def calculate_fibonacci_score(current_price, fib_236, fib_382, fib_500, fib_618, fib_786):
     """Calculate Fibonacci score based on price position relative to levels"""

@@ -2,25 +2,21 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies
+# Install dependencies
 RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
     libxml2-dev \
-    libxslt-dev \
-    libffi-dev \
-    libssl-dev \
+    libxslt1-dev \
     && rm -rf /var/lib/apt/lists/*
-
-# Copy requirements and install Python dependencies
+    
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Copy application files
+COPY google_genai_client.py .
 COPY sentiment_service.py .
 
-# Expose port
 EXPOSE 8001
 
-# Run the application
-CMD ["python", "sentiment_service.py"] 
+CMD ["uvicorn", "sentiment_service:app", "--host", "0.0.0.0", "--port", "8001"] 

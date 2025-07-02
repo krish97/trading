@@ -1,102 +1,54 @@
 # Sentiment Analysis Service
 
-A standalone microservice for real-time financial news sentiment analysis using local LLM integration.
+A standalone microservice for performing advanced financial sentiment analysis using Google's Vertex AI.
 
 ## Features
 
-- **Real-time RSS scraping** from multiple financial news sources
-- **Local LLM integration** for advanced sentiment analysis
-- **RESTful API** with FastAPI
-- **Docker containerization** for easy deployment
-- **Health monitoring** and logging
-- **Real data only** - no fallbacks, no test data, fails fast on issues
+- **Advanced AI Analysis**: Utilizes the `gemini-2.5-pro` model to perform research and analysis.
+- **Agentic Workflow**: The model acts as a financial analyst, using its own Google Search tool to find and process the latest information about a stock symbol.
+- **Rich, Structured Output**: Returns a detailed JSON object containing not just a sentiment score, but also key bullish/bearish factors, an investment recommendation, and more.
+- **Cost-Effective Batch API**: Uses the Vertex AI Batch API, which provides a 50% cost reduction compared to standard calls.
+- **RESTful API**: Built with FastAPI for easy integration.
+- **Docker Containerization**: Fully containerized for portability and simplified deployment.
+- **Health Monitoring**: Includes a `/health` endpoint for monitoring service status.
 
 ## Prerequisites
 
 - Docker and Docker Compose
-- Local LLM server running (e.g., LM Studio on port 1234)
-- Internet access for RSS feeds
+- A Google Cloud Platform project with the Vertex AI API enabled.
+- A service account key with the "Vertex AI User" role.
 
-## Quick Start
+## Configuration
 
-1. **Clone and navigate to the sentiment service directory:**
-   ```bash
-   cd sentiment-analysis
-   ```
+The service is configured via environment variables, typically set in the main `docker-compose.yml` file:
 
-2. **Copy environment file:**
-   ```bash
-   cp env.example .env
-   ```
-
-3. **Start the service:**
-   ```bash
-   docker-compose up --build -d
-   ```
-
-4. **Check health:**
-   ```bash
-   curl http://localhost:9000/health
-   ```
+- `GCP_PROJECT_ID`: Your Google Cloud Project ID.
+- `GCP_LOCATION`: The GCP region for your Vertex AI resources (e.g., `us-central1`).
+- `GOOGLE_APPLICATION_CREDENTIALS`: The path inside the container to the service account key file (e.g., `/app/vertex-sa-key.json`).
 
 ## API Endpoints
 
 ### Health Check
-```bash
-GET /health
-```
+- **Endpoint**: `GET /health`
+- **Description**: Checks the service status and the LLM client initialization.
 
-### Analyze Sentiment
-```bash
-POST /analyze
-Content-Type: application/json
+### Analyze a Single Symbol
+- **Endpoint**: `POST /analyze`
+- **Body**: `{ "symbol": "NVDA" }`
+- **Description**: Triggers a full agentic analysis for a single stock symbol.
 
-{
-  "symbol": "NVDA",
-  "max_articles": 10
-}
-```
-
-### Test LLM with Real Data
-```bash
-POST /test-llm
-```
-
-### Service Info
-```bash
-GET /
-```
-
-## Configuration
-
-Edit `.env` file to customize:
-
-- `LOCAL_LLM_URL`: URL of your local LLM server
-- `LOCAL_LLM_MODEL`: Model name for LLM
-- `SERVICE_PORT`: Port for the service (default: 8001)
-- `RSS_TIMEOUT`: Timeout for RSS feed requests
-- `MAX_ARTICLES_PER_SOURCE`: Max articles per news source
-
-## News Sources
-
-The service scrapes from:
-- Reuters Business
-- Yahoo Finance
-- MarketWatch
-- Seeking Alpha
-- Investing.com
-- Benzinga
-- FinViz
-- StockTwits
+### Analyze a Batch of Symbols
+- **Endpoint**: `POST /analyze-batch`
+- **Body**: `{ "symbols": ["NVDA", "AAPL", "TSLA"] }`
+- **Description**: Analyzes multiple stock symbols in a single, cost-effective batch request.
 
 ## Logs
 
-View logs:
+View the service's logs using Docker Compose from the project's root directory:
 ```bash
 docker-compose logs -f sentiment-analysis
 ```
-
-Logs are also mounted to `./logs/` directory.
+Logs are also mounted to the `./sentiment-analysis/logs/` directory on the host.
 
 ## Independent Operation
 
