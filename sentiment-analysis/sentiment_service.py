@@ -88,7 +88,7 @@ BUSINESS_QUALITY_ASSESSMENT: [High/Medium/Low, based on competitive moat, manage
 VALUATION_PERSPECTIVE: [Likely Overvalued/Fairly Valued/Likely Undervalued, based on your assessment]
 CONTRARIAN_SIGNAL: [Strong Buy/Buy/Hold/Avoid, based on whether current sentiment seems to misprice the long-term quality]
 INTELLIGENT_INVESTOR_SUMMARY: [A 3-sentence summary as if explaining to a fellow value investor]
-ARTICLES_ANALYZED: [Set this to 5 to indicate analysis based on your training knowledge]
+ARTICLES_ANALYZED: [Set this to {os.getenv('MAX_ARTICLES_PER_SOURCE', '50')} to indicate analysis based on your training knowledge]
 ARTICLES: [Return an empty JSON array: []]
 """
 

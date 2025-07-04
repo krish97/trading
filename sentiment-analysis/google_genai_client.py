@@ -43,7 +43,7 @@ def get_google_genai_model() -> Optional[genai.GenerativeModel]:
         print(f"Initializing Google GenAI model '{GOOGLE_MODEL}' for project='{GOOGLE_PROJECT_ID}'")
         
         # Configure the API key or use default credentials
-        genai.configure()
+        genai.configure(api_key=None)  # Use service account credentials from GOOGLE_APPLICATION_CREDENTIALS
         
         # Create the model with simple generation config
         generation_config = genai.GenerationConfig(

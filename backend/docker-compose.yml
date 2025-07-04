@@ -19,11 +19,8 @@ services:
       retries: 3
       start_period: 40s
     networks:
-      - backend-network
       - trading-shared
 
 networks:
-  backend-network:
-    driver: bridge
   trading-shared:
     external: true 

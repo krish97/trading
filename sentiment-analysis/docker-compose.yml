@@ -23,11 +23,8 @@ services:
       retries: 3
       start_period: 40s
     networks:
-      - sentiment-network
       - trading-shared
 
 networks:
-  sentiment-network:
-    driver: bridge
   trading-shared:
     external: true 
